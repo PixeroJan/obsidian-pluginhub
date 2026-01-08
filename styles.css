@@ -1,0 +1,83 @@
+.plugin-result-item, .forum-result-item {
+    background-color: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    padding: 12px;
+    margin-bottom: 12px;
+    border-radius: 8px;
+    transition: background-color 0.2s;
+}
+
+.plugin-result-item:hover, .forum-result-item:hover {
+    background-color: var(--background-secondary-alt);
+}
+
+.plugin-result-item strong {
+    font-size: 1.1em;
+    color: var(--text-accent);
+}
+
+.plugin-result-item .stars {
+    font-size: 0.9em;
+    opacity: 0.8;
+    margin-left: 8px;
+}
+
+.plugin-result-item .description {
+    font-size: 0.9em;
+    margin: 8px 0;
+    color: var(--text-muted);
+}
+
+.plugin-result-item button {
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border: none;
+    cursor: pointer;
+}
+
+.plugin-result-item button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.plugin-result-item .actions-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.desktop-only-badge {
+    background-color: #e51c23;
+    color: white;
+    font-size: 0.7em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 8px;
+    vertical-align: middle;
+    font-weight: bold;
+    text-transform: uppercase;
+}
+
+.topic-stats {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    margin-top: 4px;
+    display: flex;
+    gap: 12px;
+}
+
+.search-container input {
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    color: var(--text-normal);
+    padding: 8px;
+    border-radius: 4px;
+    width: 100%;
+}
+
+/* Make settings textareas wider */
+.vertical-tab-content-container textarea {
+    width: 100%;
+    min-height: 120px;
+    font-family: var(--font-monospace);
+}

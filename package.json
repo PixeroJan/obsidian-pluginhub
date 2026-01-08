@@ -1,0 +1,20 @@
+{
+  "name": "obsidian-plugin-hub",
+  "version": "1.0.0",
+  "description": "Browse and install Obsidian plugins across multiple vaults.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "obsidian": "latest",
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0",
+    "vite-plugin-checker": "^0.6.0"
+  }
+}
