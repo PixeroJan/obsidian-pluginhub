@@ -35,3 +35,21 @@ An Obsidian plugin that allows you to browse GitHub, the Official Community Arch
 
 1. Install dependencies: `npm install`
 2. Build the plugin: `npm run build`
+
+
+
+Settings Panel.
+
+![1_Settings.png](C:\Users\pixer\Github\PluginHub\1_Settings.png)
+
+Search Official Obsidian Plugin archive.
+
+![2_Search_official.jpg](C:\Users\pixer\Github\PluginHub\2_Search_official.jpg)
+
+Search on Github.
+
+![3_Search_github.jpg](C:\Users\pixer\Github\PluginHub\3_Search_github.jpg)
+
+Search the Obsidian Forum.
+
+![4_Search_forum.jpg](C:\Users\pixer\Github\PluginHub\4_Search_forum.jpg)
