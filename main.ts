@@ -10,13 +10,17 @@ interface PluginSettings {
 	parentVaultDirectories: string[];
 	pluginSets: PluginSet[];
 	installLocation: 'active' | 'all' | 'selected';
+	installedRepoMap: Record<string, string>;
+	githubToken: string;
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	extraVaultPaths: [],
 	parentVaultDirectories: [],
 	pluginSets: [],
-	installLocation: 'all'
+	installLocation: 'all',
+	installedRepoMap: {},
+	githubToken: ''
 }
 
 export const VIEW_TYPE_BROWSER = "plugin-hub-view";
@@ -36,6 +40,25 @@ interface GithubUser {
 	avatar_url: string;
 	html_url: string;
 	type: string;
+}
+
+interface OfficialCommunityPlugin {
+	id: string;
+	repo: string;
+	name?: string;
+	author?: string;
+	description?: string;
+}
+
+interface PluginUpdateCandidate {
+	pluginId: string;
+	currentVersion: string;
+	latestVersion?: string;
+	repo?: string;
+	source: 'official' | 'tracked' | 'detected' | 'unknown';
+	versionStatus: 'update-available' | 'up-to-date' | 'local-newer' | 'unknown';
+	needsUpdate: boolean;
+	error?: string;
 }
 
 const DESKTOP_ONLY_CACHE: Record<string, boolean> = {};
@@ -153,15 +176,29 @@ class CommunityArchiveService {
 }
 
 class GithubService {
+	private static token: string = "";
+
+	static setToken(token?: string) {
+		this.token = (token || "").trim();
+	}
+
+	private static buildHeaders(): Record<string, string> {
+		const headers: Record<string, string> = {
+			'Accept': 'application/vnd.github.v3+json'
+		};
+		if (this.token) {
+			headers['Authorization'] = `Bearer ${this.token}`;
+		}
+		return headers;
+	}
+
 	static async searchUsers(query: string): Promise<GithubUser[]> {
 		const url = `https://api.github.com/search/users?q=${encodeURIComponent(query)}&per_page=10`;
 		try {
 			const response = await requestUrl({
 				url: url,
 				method: 'GET',
-				headers: {
-					'Accept': 'application/vnd.github.v3+json'
-				}
+				headers: this.buildHeaders()
 			});
 			return response.json.items || [];
 		} catch (e) {
@@ -176,9 +213,7 @@ class GithubService {
 			const response = await requestUrl({
 				url: url,
 				method: 'GET',
-				headers: {
-					'Accept': 'application/vnd.github.v3+json'
-				}
+				headers: this.buildHeaders()
 			});
 			return response.json.items || [];
 		} catch (error: any) {
@@ -194,6 +229,7 @@ class GithubService {
 		const response = await requestUrl({
 			url: url,
 			method: 'GET',
+			headers: this.buildHeaders()
 		});
 		return response.json;
 	}
@@ -204,12 +240,30 @@ export default class PluginHub extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		GithubService.setToken(this.settings.githubToken);
 
 		this.addRibbonIcon('search', 'Browse Plugins', () => {
 			this.activateView();
 		});
 
 		this.addSettingTab(new PluginHubSettingTab(this.app, this));
+
+		this.addCommand({
+			id: 'update-installed-plugins-from-github',
+			name: 'Check installed plugins for GitHub updates',
+			callback: async () => {
+				const candidates = await this.checkInstalledPluginUpdates();
+				const repos = candidates
+					.filter((candidate) => candidate.needsUpdate && candidate.repo)
+					.map((candidate) => candidate.repo as string);
+				if (repos.length === 0) {
+					new Notice("No updates found for installed plugins.");
+					return;
+				}
+				const { updated, failed } = await this.updatePluginsByRepo(repos);
+				new Notice(`Update finished: ${updated} updated${failed > 0 ? `, ${failed} failed` : ''}.`);
+			}
+		});
 
 		this.registerView(
 			VIEW_TYPE_BROWSER,
@@ -242,13 +296,300 @@ export default class PluginHub extends Plugin {
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		GithubService.setToken(this.settings.githubToken);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
 
-	async installPluginFromGithub(fullName: string) {
+	private async getOfficialCommunityPlugins(): Promise<OfficialCommunityPlugin[]> {
+		const url = "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json";
+		const response = await requestUrl({ url });
+		return response.json || [];
+	}
+
+	private async getInstalledPluginManifestFromDisk(pluginId: string): Promise<any | null> {
+		const manifestPath = `${this.app.vault.configDir}/plugins/${pluginId}/manifest.json`;
+		try {
+			if (!(await this.app.vault.adapter.exists(manifestPath))) {
+				return null;
+			}
+			const content = await this.app.vault.adapter.read(manifestPath);
+			return JSON.parse(content);
+		} catch {
+			return null;
+		}
+	}
+
+	private compareVersions(current: string, latest: string): number {
+		const normalize = (version: string) => version.split('-')[0].split('.').map((part) => Number.parseInt(part, 10) || 0);
+		const currentParts = normalize(current);
+		const latestParts = normalize(latest);
+		const maxLen = Math.max(currentParts.length, latestParts.length);
+
+		for (let i = 0; i < maxLen; i++) {
+			const a = currentParts[i] ?? 0;
+			const b = latestParts[i] ?? 0;
+			if (a < b) return -1;
+			if (a > b) return 1;
+		}
+
+		return 0;
+	}
+
+	private async getLatestManifestVersionFromRepo(fullName: string): Promise<string | null> {
+		const release = await GithubService.getLatestRelease(fullName);
+		const assets = release.assets || [];
+		const manifestAsset = assets.find((asset: any) => asset.name === 'manifest.json');
+		if (!manifestAsset?.browser_download_url) {
+			return null;
+		}
+
+		const manifestResp = await requestUrl({ url: manifestAsset.browser_download_url });
+		return manifestResp.json?.version || null;
+	}
+
+	private async repoMatchesPluginId(fullName: string, pluginId: string): Promise<boolean> {
+		try {
+			const manifestUrl = `https://raw.githubusercontent.com/${fullName}/HEAD/manifest.json`;
+			const manifestResp = await requestUrl({ url: manifestUrl });
+			return manifestResp.status === 200 && manifestResp.json?.id === pluginId;
+		} catch {
+			return false;
+		}
+	}
+
+	private parseGithubOwnerFromAuthorUrl(authorUrl?: string): string | undefined {
+		if (!authorUrl) return undefined;
+		const match = authorUrl.match(/github\.com\/(?:users\/)?([^/]+)/i);
+		return match?.[1];
+	}
+
+	private normalizeRepoToken(input?: string): string | undefined {
+		if (!input) return undefined;
+		return input
+			.toLowerCase()
+			.trim()
+			.replace(/[^a-z0-9]+/g, '-')
+			.replace(/^-+|-+$/g, '');
+	}
+
+	private compactRepoToken(input?: string): string | undefined {
+		if (!input) return undefined;
+		const normalized = this.normalizeRepoToken(input);
+		if (!normalized) return undefined;
+		return normalized.replace(/-/g, '');
+	}
+
+	private async findRepoByKnownPatterns(pluginId: string, manifest: any): Promise<string | undefined> {
+		const owner = this.parseGithubOwnerFromAuthorUrl(manifest?.authorUrl);
+		if (!owner) return undefined;
+
+		const idToken = this.normalizeRepoToken(pluginId);
+		const nameToken = this.normalizeRepoToken(manifest?.name);
+		const compactIdToken = this.compactRepoToken(pluginId);
+		const compactNameToken = this.compactRepoToken(manifest?.name);
+		const candidates = [
+			idToken ? `${owner}/obsidian-${idToken}` : undefined,
+			idToken ? `${owner}/${idToken}` : undefined,
+			compactIdToken ? `${owner}/${compactIdToken}` : undefined,
+			nameToken ? `${owner}/obsidian-${nameToken}` : undefined,
+			nameToken ? `${owner}/${nameToken}` : undefined,
+			compactNameToken ? `${owner}/${compactNameToken}` : undefined,
+			idToken ? `${owner}/obsidian-plugin-${idToken}` : undefined
+		].filter((candidate): candidate is string => Boolean(candidate));
+
+		for (const repo of [...new Set(candidates)]) {
+			if (await this.repoMatchesPluginId(repo, pluginId)) {
+				return repo;
+			}
+		}
+
+		return undefined;
+	}
+
+	private async findRepoByManifestId(pluginId: string, manifest: any): Promise<{ repo?: string; reason?: string }> {
+		const fromKnownPattern = await this.findRepoByKnownPatterns(pluginId, manifest);
+		if (fromKnownPattern) {
+			return { repo: fromKnownPattern };
+		}
+
+		const owner = this.parseGithubOwnerFromAuthorUrl(manifest?.authorUrl);
+		const queries = [
+			owner ? `user:${owner} obsidian ${pluginId} in:name` : undefined,
+			`obsidian ${pluginId} in:name`,
+			`"${pluginId}" obsidian plugin`
+		].filter((query): query is string => Boolean(query));
+
+		let rateLimited = false;
+
+		for (const query of queries) {
+			let repos: GithubRepo[] = [];
+			try {
+				repos = await GithubService.searchPlugins(query, "updated");
+			} catch (e: any) {
+				if ((e?.message || '').includes('403')) {
+					rateLimited = true;
+				}
+				continue;
+			}
+
+			for (const repo of repos.slice(0, 12)) {
+				if (await this.repoMatchesPluginId(repo.full_name, pluginId)) {
+					return { repo: repo.full_name };
+				}
+			}
+		}
+
+		if (rateLimited) {
+			return { reason: 'GitHub API rate limit reached during repository detection.' };
+		}
+
+		return { reason: 'No GitHub repository with matching manifest id was found.' };
+	}
+
+	async checkInstalledPluginUpdates(): Promise<PluginUpdateCandidate[]> {
+		const pluginManager = (this.app as any).plugins;
+		if (typeof pluginManager?.loadManifests === 'function') {
+			try {
+				await pluginManager.loadManifests();
+			} catch {
+				// Ignore and continue with available manifests
+			}
+		}
+		const manifests = pluginManager?.manifests || {};
+		const installedPluginIds = Object.keys(manifests);
+
+		if (installedPluginIds.length === 0) {
+			return [];
+		}
+
+		const officialPlugins = await this.getOfficialCommunityPlugins();
+		const repoById = new Map<string, string>();
+		for (const p of officialPlugins) {
+			if (p?.id && p?.repo) {
+				repoById.set(p.id, p.repo);
+			}
+		}
+
+		let mappingChanged = false;
+		const candidates: PluginUpdateCandidate[] = [];
+
+		for (const pluginId of installedPluginIds) {
+			const installedManifestFromDisk = await this.getInstalledPluginManifestFromDisk(pluginId);
+			const installedManifest = installedManifestFromDisk || manifests[pluginId] || {};
+			const currentVersion = installedManifest?.version || "0.0.0";
+			let repo = repoById.get(pluginId);
+			let source: PluginUpdateCandidate['source'] = repo ? 'official' : 'unknown';
+			let unresolvedReason = 'Could not map plugin to a GitHub repository.';
+
+			if (!repo && this.settings.installedRepoMap[pluginId]) {
+				repo = this.settings.installedRepoMap[pluginId];
+				source = 'tracked';
+			}
+
+			if (!repo) {
+				const detected = await this.findRepoByManifestId(pluginId, installedManifest);
+				repo = detected.repo;
+				if (!repo && detected.reason) {
+					unresolvedReason = detected.reason;
+				}
+				if (repo) {
+					this.settings.installedRepoMap[pluginId] = repo;
+					mappingChanged = true;
+					source = 'detected';
+				}
+			}
+
+			if (!repo) {
+				candidates.push({
+					pluginId,
+					currentVersion,
+					source: 'unknown',
+					versionStatus: 'unknown',
+					needsUpdate: false,
+					error: unresolvedReason
+				});
+				continue;
+			}
+
+			try {
+				const latestVersion = await this.getLatestManifestVersionFromRepo(repo);
+				if (!latestVersion) {
+					candidates.push({
+						pluginId,
+						currentVersion,
+						repo,
+						source,
+						versionStatus: 'unknown',
+						needsUpdate: false,
+						error: 'No manifest.json in latest release.'
+					});
+					continue;
+				}
+
+				const versionCompare = this.compareVersions(currentVersion, latestVersion);
+				const needsUpdate = versionCompare < 0;
+				const versionStatus: PluginUpdateCandidate['versionStatus'] = versionCompare < 0
+					? 'update-available'
+					: versionCompare === 0
+						? 'up-to-date'
+						: 'local-newer';
+				candidates.push({
+					pluginId,
+					currentVersion,
+					latestVersion,
+					repo,
+					source,
+					versionStatus,
+					needsUpdate
+				});
+			} catch (e: any) {
+				candidates.push({
+					pluginId,
+					currentVersion,
+					repo,
+					source,
+					versionStatus: 'unknown',
+					needsUpdate: false,
+					error: e?.message || 'Failed to check latest release.'
+				});
+			}
+		}
+
+		if (mappingChanged) {
+			await this.saveSettings();
+		}
+
+		return candidates.sort((a, b) => {
+			if (a.needsUpdate !== b.needsUpdate) {
+				return a.needsUpdate ? -1 : 1;
+			}
+			return a.pluginId.localeCompare(b.pluginId);
+		});
+	}
+
+	async updatePluginsByRepo(repos: string[]): Promise<{ updated: number; failed: number }> {
+		let updated = 0;
+		let failed = 0;
+		const uniqueRepos = [...new Set(repos)];
+
+		for (const fullName of uniqueRepos) {
+			try {
+				await this.installPluginFromGithub(fullName, { showNotice: false });
+				updated++;
+			} catch (e) {
+				console.error(`Failed to update ${fullName}`, e);
+				failed++;
+			}
+		}
+
+		return { updated, failed };
+	}
+
+	async installPluginFromGithub(fullName: string, options: { showNotice?: boolean } = {}) {
+		const showNotice = options.showNotice ?? true;
 		const release = await GithubService.getLatestRelease(fullName);
 		const assets = release.assets;
 		
@@ -263,6 +604,10 @@ export default class PluginHub extends Plugin {
 		const manifestResp = await requestUrl({ url: manifestJson.browser_download_url });
 		const manifest = manifestResp.json;
 		const pluginId = manifest.id;
+		if (pluginId && this.settings.installedRepoMap[pluginId] !== fullName) {
+			this.settings.installedRepoMap[pluginId] = fullName;
+			await this.saveSettings();
+		}
 
 		const pluginDir = `${this.app.vault.configDir}/plugins/${pluginId}`;
 		
@@ -281,7 +626,9 @@ export default class PluginHub extends Plugin {
 		const useSelectedVaults = this.settings.installLocation === 'all' || this.settings.installLocation === 'selected';
 
 		if (installToActive) {
-			await this.app.vault.adapter.mkdir(pluginDir);
+			if (!(await this.app.vault.adapter.exists(pluginDir))) {
+				await this.app.vault.adapter.mkdir(pluginDir);
+			}
 			await this.app.vault.adapter.write(`${pluginDir}/main.js`, mainJsResp.text);
 			await this.app.vault.adapter.write(`${pluginDir}/manifest.json`, manifestContent);
 			if (stylesCss) {
@@ -339,7 +686,9 @@ export default class PluginHub extends Plugin {
 
 		// Reload plugins
 		await (this.app as any).plugins.loadManifests();
-		new Notice(`Installed ${fullName}${installToActive ? ' to active vault' : ''}${targetVaultsCount > 0 ? ` and ${targetVaultsCount} extra vaults` : ''}.`);
+		if (showNotice) {
+			new Notice(`Installed ${fullName}${installToActive ? ' to active vault' : ''}${targetVaultsCount > 0 ? ` and ${targetVaultsCount} extra vaults` : ''}.`);
+		}
 	}
 }
 
@@ -375,11 +724,146 @@ class PluginBrowserView extends ItemView {
 		btnRow.style.gap = "8px";
 		btnRow.style.marginBottom = "20px";
 
-		const archiveBtn = btnRow.createEl("button", { text: "Official Archive", cls: "mod-cta" });
+		const archiveBtn = btnRow.createEl("button", { text: "Official Archive" });
 		const githubBtn = btnRow.createEl("button", { text: "Search GitHub" });
 		const forumBtn = btnRow.createEl("button", { text: "Search Forum" });
+		const checkUpdatesBtn = btnRow.createEl("button", { text: "Check Updates" });
 		
 		const results = container.createDiv({ cls: "results-container" });
+
+		const renderUpdateCandidates = (candidates: PluginUpdateCandidate[]) => {
+			results.empty();
+
+			if (candidates.length === 0) {
+				results.createEl("p", { text: "No installed plugins found." });
+				return;
+			}
+
+			const updatable = candidates.filter((candidate) => candidate.repo);
+			const needsUpdate = updatable.filter((candidate) => candidate.versionStatus === 'update-available');
+			const upToDate = updatable.filter((candidate) => candidate.versionStatus === 'up-to-date');
+			const localNewer = updatable.filter((candidate) => candidate.versionStatus === 'local-newer');
+			const unknownVersion = updatable.filter((candidate) => candidate.versionStatus === 'unknown');
+			const unresolved = candidates.filter((candidate) => !candidate.repo);
+
+			results.createEl("h4", { text: "Plugin updates" });
+			results.createEl("p", {
+				text: `${needsUpdate.length} update(s) available, ${upToDate.length} up to date, ${localNewer.length} local newer than latest release, ${unknownVersion.length} unknown version status, ${unresolved.length} unresolved.`
+			});
+
+			if (needsUpdate.length > 0) {
+				const controls = results.createDiv();
+				controls.style.display = "flex";
+				controls.style.gap = "8px";
+				controls.style.marginBottom = "12px";
+
+				const updateSelectedBtn = controls.createEl("button", { text: "Update Selected", cls: "mod-cta" });
+				const selectAllBtn = controls.createEl("button", { text: "Select All" });
+				const clearBtn = controls.createEl("button", { text: "Clear" });
+
+				const checkboxMap = new Map<string, HTMLInputElement>();
+
+				for (const candidate of needsUpdate) {
+					const row = results.createDiv({ cls: "plugin-result-item" });
+					row.style.display = "flex";
+					row.style.alignItems = "flex-start";
+					row.style.gap = "8px";
+
+					const checkbox = row.createEl("input", { type: "checkbox" });
+					checkbox.checked = candidate.needsUpdate;
+
+					const details = row.createDiv();
+					details.createEl("strong", {
+						text: `${candidate.pluginId} (Installed ${candidate.currentVersion}, Latest ${candidate.latestVersion || "unknown"})`
+					});
+					details.createEl("div", { text: `${candidate.repo} [${candidate.source}]` });
+					if (candidate.error) {
+						details.createEl("div", { text: candidate.error });
+					}
+
+					checkboxMap.set(candidate.pluginId, checkbox);
+				}
+
+				selectAllBtn.addEventListener("click", () => {
+					checkboxMap.forEach((checkbox) => {
+						checkbox.checked = true;
+					});
+				});
+
+				clearBtn.addEventListener("click", () => {
+					checkboxMap.forEach((checkbox) => {
+						checkbox.checked = false;
+					});
+				});
+
+				updateSelectedBtn.addEventListener("click", async () => {
+					const selectedRepos = needsUpdate
+						.filter((candidate) => checkboxMap.get(candidate.pluginId)?.checked)
+						.map((candidate) => candidate.repo as string);
+
+					if (selectedRepos.length === 0) {
+						new Notice("No plugins selected for update.");
+						return;
+					}
+
+					updateSelectedBtn.disabled = true;
+					updateSelectedBtn.innerText = "Updating...";
+					try {
+						const { updated, failed } = await this.plugin.updatePluginsByRepo(selectedRepos);
+						new Notice(`Update finished: ${updated} updated${failed > 0 ? `, ${failed} failed` : ''}.`);
+						const refreshed = await this.plugin.checkInstalledPluginUpdates();
+						renderUpdateCandidates(refreshed);
+					} catch (e: any) {
+						new Notice("Failed to update selected plugins: " + (e?.message || "Unknown error"));
+						updateSelectedBtn.disabled = false;
+						updateSelectedBtn.innerText = "Update Selected";
+					}
+				});
+			} else {
+				results.createEl("p", { text: "No newer releases found for resolved plugins." });
+			}
+
+			if (localNewer.length > 0) {
+				results.createEl("h5", { text: "Installed version is newer than latest release" });
+				for (const candidate of localNewer) {
+					const row = results.createDiv({ cls: "plugin-result-item" });
+					row.createEl("strong", {
+						text: `${candidate.pluginId} (Installed ${candidate.currentVersion}, Latest ${candidate.latestVersion || "unknown"})`
+					});
+					row.createEl("div", { text: `${candidate.repo} [${candidate.source}]` });
+				}
+			}
+
+			if (upToDate.length > 0) {
+				results.createEl("h5", { text: "Up to date" });
+				for (const candidate of upToDate) {
+					const row = results.createDiv({ cls: "plugin-result-item" });
+					row.createEl("strong", { text: `${candidate.pluginId} (${candidate.currentVersion})` });
+					row.createEl("div", { text: `${candidate.repo} [${candidate.source}]` });
+				}
+			}
+
+			if (unknownVersion.length > 0) {
+				results.createEl("h5", { text: "Could not compare versions" });
+				for (const candidate of unknownVersion) {
+					const row = results.createDiv({ cls: "plugin-result-item" });
+					row.createEl("strong", { text: candidate.pluginId });
+					row.createEl("div", { text: `${candidate.repo} [${candidate.source}]` });
+					if (candidate.error) {
+						row.createEl("p", { text: candidate.error });
+					}
+				}
+			}
+
+			if (unresolved.length > 0) {
+				results.createEl("h5", { text: "Could not resolve repository" });
+				for (const candidate of unresolved) {
+					const row = results.createDiv({ cls: "plugin-result-item" });
+					row.createEl("strong", { text: candidate.pluginId });
+					row.createEl("p", { text: candidate.error || "Unknown error" });
+				}
+			}
+		};
 
 		const renderRepos = (repos: GithubRepo[]) => {
 			results.empty();
@@ -563,7 +1047,10 @@ class PluginBrowserView extends ItemView {
 				img.style.borderRadius = "50%";
 				img.style.marginBottom = "5px";
 
-				card.createEl("div", { text: user.login, style: "font-weight: bold; overflow: hidden; text-overflow: ellipsis;" });
+				const userLabel = card.createEl("div", { text: user.login });
+				userLabel.style.fontWeight = "bold";
+				userLabel.style.overflow = "hidden";
+				userLabel.style.textOverflow = "ellipsis";
 				
 				card.addEventListener("click", async () => {
 					// Directly trigger plugin search for this user
@@ -619,7 +1106,8 @@ class PluginBrowserView extends ItemView {
 				console.error(e);
 				results.empty();
 				if (e.message && e.message.includes("403")) {
-					results.createEl("p", { text: "⚠️ GitHub API Rate Limit Exceeded.", style: "color: var(--text-error);" });
+					const errorLine = results.createEl("p", { text: "⚠️ GitHub API Rate Limit Exceeded." });
+					errorLine.style.color = "var(--text-error)";
 					results.createEl("p", { text: "Please wait a moment before searching again." });
 				} else {
 					results.createEl("p", { text: "Error searching: " + e.message });
@@ -675,6 +1163,23 @@ class PluginBrowserView extends ItemView {
 				results.createEl("p", { text: "Error searching forum: " + e.message });
 			}
 		});
+
+		checkUpdatesBtn.addEventListener("click", async () => {
+			checkUpdatesBtn.disabled = true;
+			const oldText = checkUpdatesBtn.innerText;
+			checkUpdatesBtn.innerText = "Checking...";
+			results.empty();
+			results.createEl("p", { text: "Checking installed plugins against GitHub releases..." });
+			try {
+				const candidates = await this.plugin.checkInstalledPluginUpdates();
+				renderUpdateCandidates(candidates);
+			} catch (e: any) {
+				new Notice("Failed to check plugin updates: " + (e?.message || "Unknown error"));
+			} finally {
+				checkUpdatesBtn.disabled = false;
+				checkUpdatesBtn.innerText = oldText;
+			}
+		});
 	}
 }
 
@@ -691,6 +1196,21 @@ class PluginHubSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		containerEl.createEl("h2", { text: "Installation Settings" });
+
+		new Setting(containerEl)
+			.setName('GitHub API Token (optional)')
+			.setDesc('Increase GitHub API quota and reduce 403 rate-limit errors. Stored in plugin settings.')
+			.addText((text) => {
+				text.setPlaceholder('ghp_... or github_pat_...')
+					.setValue(this.plugin.settings.githubToken || '')
+					.onChange(async (value) => {
+						this.plugin.settings.githubToken = value.trim();
+						GithubService.setToken(this.plugin.settings.githubToken);
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.type = 'password';
+				text.inputEl.autocomplete = 'off';
+			});
 
 		new Setting(containerEl)
 			.setName('Install Location')

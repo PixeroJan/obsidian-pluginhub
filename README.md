@@ -11,6 +11,7 @@ An Obsidian plugin that allows you to browse GitHub, the Official Community Arch
 - **Official Archive Search:** Access the list of ~1,000 approved community plugins instantly.
 - **GitHub Search:** find repositories with keyword matching and author-specific searching (use `@username`).
 - **Forum Search:** search the Obsidian Forum for plugin announcements.
+- **Check Updates + Selective Update:** checks installed plugins against GitHub releases (official list + detected non-official repos), marks available updates, and lets you choose what to update.
 - **Plugin Sets:** Save collections of plugins into "Sets" (e.g., "Daily Setup", "Developer Tools") and install the entire group with one click.
 - **Multi-Vault Installation:**
   - **All Vaults under parent folder:** Enter a parent folder (like your iCloud Obsidian folder), and it will automatically find all vaults within it.
@@ -27,6 +28,8 @@ An Obsidian plugin that allows you to browse GitHub, the Official Community Arch
 ## Settings Configuration
 
 - **Install location:** Active Vault, All Vaults, Selected Vaults.
+- **GitHub API Token (optional):** Adds authenticated GitHub API requests for higher quota and fewer 403 rate-limit errors.
+- **Check Updates button:** In the browser view, compares installed version vs latest release `manifest.json` version and shows selectable updates.
 - **All Vaults under parent folder:** Set paths to master folders (e.g. `C:\Users\You\iCloudDrive\iCloud~md~obsidian`). It will scan every subfolder containing a `.obsidian` folder. One path per line if many. I.e. One folder on your Mac/PC and one on Icloud.
 - **Selected Vaults:** List specific vaults.
 - **Manage Sets:** Create, name, and manage your custom plugin sets.
