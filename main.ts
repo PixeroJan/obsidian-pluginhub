@@ -1054,7 +1054,7 @@ class PluginBrowserView extends ItemView {
 				
 				card.addEventListener("click", async () => {
 					// Directly trigger plugin search for this user
-					const query = `user:${user.login} obsidian NOT vault NOT configuration`;
+					const query = `user:${user.login}`;
 					results.empty();
 					results.createEl("p", { text: `Searching plugins by ${user.login}...` });
 					
